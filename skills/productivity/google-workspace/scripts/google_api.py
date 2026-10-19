@@ -137,21 +137,33 @@ def _headers_dict(msg: dict) -> dict[str, str]:
 
 
 def _extract_message_body(msg: dict) -> str:
-    body = ""
-    payload = msg.get("payload", {})
-    if payload.get("body", {}).get("data"):
-        body = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
-    elif payload.get("parts"):
-        for part in payload["parts"]:
-            if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
-                body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
-                break
-        if not body:
-            for part in payload["parts"]:
-                if part.get("mimeType") == "text/html" and part.get("body", {}).get("data"):
-                    body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
-                    break
-    return body
+    """Prefer visible plain text, with HTML fallback, throughout the MIME tree."""
+    def text_parts(part: dict):
+        mime_type = part.get("mimeType", "text/plain").lower()
+        if mime_type == "message/rfc822" or part.get("filename") or any(
+            header.get("name", "").lower() == "content-disposition"
+            and header.get("value", "").partition(";")[0].strip().lower() == "attachment"
+            for header in part.get("headers", [])
+        ):
+            return
+
+        data = part.get("body", {}).get("data")
+        if mime_type in ("text/plain", "text/html") and data:
+            text = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode(
+                "utf-8", errors="replace",
+            )
+            if text:
+                yield mime_type, text
+        for child in part.get("parts", []):
+            yield from text_parts(child)
+
+    html = ""
+    for mime_type, text in text_parts(msg.get("payload", {})):
+        if mime_type == "text/plain":
+            return text
+        if not html:
+            html = text
+    return html
 
 
 def _extract_body_text(body: dict) -> str:

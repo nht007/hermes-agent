@@ -1,5 +1,6 @@
 """Tests for Google Workspace gws bridge and CLI wrapper."""
 
+import base64
 import importlib.util
 import json
 import subprocess
@@ -20,6 +21,103 @@ API_PATH = (
     Path(__file__).resolve().parents[2]
     / "skills/productivity/google-workspace/scripts/google_api.py"
 )
+
+
+def _gmail_text_part(mime_type, text, *, padded=True):
+    data = base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
+    return {
+        "mimeType": mime_type,
+        "body": {"data": data if padded else data.rstrip("=")},
+    }
+
+
+@pytest.fixture(params=["gws", "python-client"])
+def read_gmail_message(request, api_module, monkeypatch, capsys):
+    def read(payload):
+        message = {
+            "id": "message-1", "threadId": "thread-1",
+            "payload": {**payload, "headers": [
+                {"name": "Subject", "value": "Confirmation"},
+                *payload.get("headers", []),
+            ]},
+        }
+        if request.param == "gws":
+            fetch = MagicMock(return_value=message)
+            monkeypatch.setattr(api_module, "_run_gws", fetch)
+        else:
+            monkeypatch.setattr(api_module, "_gws_binary", lambda: None)
+            service = MagicMock()
+            fetch = service.users.return_value.messages.return_value.get
+            fetch.return_value.execute.return_value = message
+            monkeypatch.setattr(api_module, "build_service", lambda *args: service)
+
+        api_module.gmail_get(types.SimpleNamespace(message_id=message["id"]))
+        result = json.loads(capsys.readouterr().out)
+        if request.param == "gws":
+            fetch.assert_called_once_with(
+                ["gmail", "users", "messages", "get"],
+                params={"userId": "me", "id": message["id"], "format": "full"},
+            )
+        else:
+            fetch.assert_called_once_with(userId="me", id=message["id"], format="full")
+        assert result["id"] == message["id"]
+        assert result["threadId"] == message["threadId"]
+        assert result["subject"] == "Confirmation"
+        return result["body"]
+
+    return read
+
+
+@pytest.mark.parametrize(
+    "payload, expected",
+    [
+        (_gmail_text_part("text/plain", "Confirmed ✓"), "Confirmed ✓"),
+        (_gmail_text_part("text/plain", "Confirmed ✓", padded=False), "Confirmed ✓"),
+        (_gmail_text_part("text/html", "<p>Confirmed</p>"), "<p>Confirmed</p>"),
+        ({"mimeType": "multipart/alternative", "parts": [
+            _gmail_text_part("text/html", "<p>HTML alternative</p>"),
+            _gmail_text_part("text/plain", "Plain alternative"),
+        ]}, "Plain alternative"),
+        ({"mimeType": "multipart/mixed", "parts": [
+            _gmail_text_part("text/html", "<p>Earlier HTML</p>"),
+            {"mimeType": "multipart/related", "parts": [
+                {"mimeType": "multipart/alternative", "parts": [
+                    _gmail_text_part("text/html", "<p>Confirmation</p>"),
+                    _gmail_text_part("text/plain", "Nested confirmation"),
+                ]},
+                {"mimeType": "image/png", "body": {"attachmentId": "image-1"}},
+            ]},
+        ]}, "Nested confirmation"),
+        ({"mimeType": "multipart/mixed", "parts": [
+            {"mimeType": "multipart/related", "parts": [
+                _gmail_text_part("text/html", "<p>Nested HTML only</p>"),
+            ]},
+        ]}, "<p>Nested HTML only</p>"),
+        ({"mimeType": "multipart/mixed", "parts": []}, ""),
+    ],
+    ids=["root-plain", "unpadded", "root-html", "plain-preference", "nested-plain", "nested-html", "empty"],
+)
+def test_gmail_get_reads_visible_text_at_any_mime_depth(read_gmail_message, payload, expected):
+    assert read_gmail_message(payload) == expected
+
+
+def test_gmail_get_excludes_attached_text_and_messages(read_gmail_message):
+    payload = {"mimeType": "multipart/mixed", "parts": [
+        {**_gmail_text_part("text/plain", "Text attachment"), "filename": "notes.txt"},
+        {"mimeType": "message/rfc822", "filename": "forwarded.eml", "parts": [
+            _gmail_text_part("text/plain", "Attached message body"),
+        ]},
+        {"mimeType": "message/rfc822", "parts": [
+            _gmail_text_part("text/plain", "Unnamed attached message body"),
+        ]},
+        {**_gmail_text_part("text/plain", "Disposition attachment"), "headers": [
+            {"name": "Content-Disposition", "value": "ATTACHMENT; filename=notes.txt"},
+        ]},
+        {"mimeType": "multipart/related", "parts": [
+            _gmail_text_part("text/html", "<p>Visible body</p>"),
+        ]},
+    ]}
+    assert read_gmail_message(payload) == "<p>Visible body</p>"
 
 
 @pytest.fixture
